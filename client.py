@@ -1,7 +1,8 @@
 
 import requests
 
-url = "http://127.0.0.1:8000/"
+# url = "http://127.0.0.1:8000/"
+url = "http://34.94.180.23:8000"
 headers = {
     "Content-Type": "application/json"
 }
@@ -18,4 +19,4 @@ while True:
     print(response.status_code)
     print(response.json()["messages"][-1]["content"])  # or response.text
 
-    print("\n\n\n\n")
+    print()
