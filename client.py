@@ -16,6 +16,6 @@ while True:
     response = requests.post(url, json=data, headers=headers)
 
     print(response.status_code)
-    print(response.json()["messages"][-1])  # or response.text
+    print(response.json()["messages"][-1]["content"])  # or response.text
 
     print("\n\n\n\n")
