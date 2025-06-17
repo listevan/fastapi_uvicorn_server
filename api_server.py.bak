@@ -1,0 +1,124 @@
+import requests
+import json
+from collections import deque
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+import os
+import getpass
+
+from langchain.chat_models import init_chat_model
+model = init_chat_model("gpt-4o-mini", model_provider="openai")
+
+from langchain_core.messages import HumanMessage
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import START, MessagesState, StateGraph
+workflow = StateGraph(state_schema=MessagesState)
+
+# Define the function that calls the model
+def call_model(state: MessagesState):
+    response = model.invoke(state["messages"])
+    return {"messages": response}
+
+# Define the (single) node in the graph
+workflow.add_edge(START, "model")
+workflow.add_node("model", call_model)
+
+# Add memory
+memory = MemorySaver()
+model_app = workflow.compile(checkpointer=memory)
+
+app = FastAPI()
+
+# add tagged people in as their usernames instead of @user_n
+def parse_text(text: str, people: str) -> tuple[str, bool]:
+    # check if bot is tagged
+    found = False
+    for person in people:
+        if person["id"]["open_id"] == "ou_d3a71fee8bc08a348367b68280013f87": # update with bot open_id
+            found = True
+            text.replace(person["key"], "")
+        # replace key with name for request if its not the bot
+        else:
+            text.replace(person["key"], person["name"])
+
+    return (text, found)
+
+# create a mini database of previous messages to prevent duplicate processes
+message_id_set = set()
+message_id_q = deque()
+message_id_max = 1000
+
+@app.post("/")
+async def post_root(request: Request):
+    # act on payload
+    body = await request.json()
+    # print(json.dumps(body, indent=4))
+
+    if "challenge" in body:
+        # Required for Feishu verification
+        return JSONResponse(content={"challenge": body["challenge"]})
+
+    # deduplication
+    event_id = body["event"]["message"]["message_id"]
+    if event_id in message_id_set:
+        return JSONResponse(content={"code": 0}) 
+    if len(message_id_q) >= message_id_max:
+        oldest = message_id_q.popleft()
+        message_id_set.remove(oldest)
+    message_id_set.add(event_id)
+    message_id_q.append(event_id)
+
+    # Normal event
+    people = body["event"]["message"].get("mentions", [])
+    words = json.loads(body['event']['message']['content'])['text']
+    chat_type =  body["event"]["message"]["chat_type"]
+    
+    text, tagged = parse_text(words, people)
+    
+    if not tagged and chat_type == "group":
+        print("not tagged")
+        return JSONResponse(content={"code": 0})
+    
+    sender_id = body['event']['message']['chat_id']
+    # sender_id = body['event']['sender']['sender_id']['open_id']
+    print("Received Message:", text)
+
+    config = {"configurable": {"thread_id": "123456"}}
+    output = model_app.invoke({"messages": [HumanMessage(text)]}, config)
+
+    # get tenant_access_token
+    headers = {
+        "Content-Type": "application/json"
+    }
+    content = {
+        "app_id": os.environ["APP_ID"],
+        "app_secret": os.environ["APP_SECRET"]
+    }
+    response = requests.post("https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal", json=content, headers=headers).json()
+    if response["code"] != 0:
+        print(f"Error Code {response["code"]}, {response["msg"]}")
+        return JSONResponse(content={"code": response["code"]})
+    tenant_access_token = response["tenant_access_token"]
+
+    # Post back to Feishu
+    headers = {
+        "Authorization": f"Bearer {tenant_access_token}",
+        "Content-Type": "application/json"
+    }
+    output_text: str = output['messages'][-1].content
+    print(output_text)
+    content = {
+        "receive_id": sender_id,
+        "msg_type": "text",
+        "content": "{\"text\":\"" + output_text + "\"}"
+    }
+    response = requests.post("https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id", json=content, headers=headers)
+    print(response)
+    # if not response.ok:
+    #     print("Message Sned Failed:", response)
+
+    return JSONResponse(content={"code": 0})
+
